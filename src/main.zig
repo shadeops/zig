@@ -24,6 +24,8 @@ const clang = @import("clang.zig");
 const Cache = std.Build.Cache;
 const target_util = @import("target.zig");
 const crash_report = @import("crash_report.zig");
+const Module = @import("Module.zig");
+const AstGen = @import("AstGen.zig");
 
 pub const std_options = struct {
     pub const wasiCwd = wasi_cwd;
@@ -3446,15 +3448,13 @@ fn buildOutputType(
                             var errors = try comp.getAllErrorsAlloc();
                             defer errors.deinit(comp.gpa);
 
-                            if (errors.list.len != 0) {
+                            if (errors.errorMessageCount() > 0) {
                                 const ttyconf: std.debug.TTY.Config = switch (comp.color) {
                                     .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
                                     .on => .escape_codes,
                                     .off => .no_color,
                                 };
-                                for (errors.list) |full_err_msg| {
-                                    try full_err_msg.renderToWriter(ttyconf, conn.stream.writer(), "error:", .Red, 0);
-                                }
+                                try errors.renderToWriter(ttyconf, conn.stream.writer());
                                 continue;
                             }
                         } else {
@@ -3830,15 +3830,13 @@ fn updateModule(gpa: Allocator, comp: *Compilation, hook: AfterUpdateHook) !void
     var errors = try comp.getAllErrorsAlloc();
     defer errors.deinit(comp.gpa);
 
-    if (errors.list.len != 0) {
+    if (errors.errorMessageCount() > 0) {
         const ttyconf: std.debug.TTY.Config = switch (comp.color) {
             .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
             .on => .escape_codes,
             .off => .no_color,
         };
-        for (errors.list) |full_err_msg| {
-            full_err_msg.renderToStdErr(ttyconf);
-        }
+        errors.renderToStdErr(ttyconf);
         const log_text = comp.getCompileLogOutput();
         if (log_text.len != 0) {
             std.debug.print("\nCompile Log Output:\n{s}", .{log_text});
@@ -4434,9 +4432,13 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
             var all_modules: Package.AllModules = .{};
             defer all_modules.deinit(gpa);
 
+            var errors: std.zig.ErrorBundle = undefined;
+            try errors.init(gpa);
+            defer errors.deinit(gpa);
+
             // Here we borrow main package's table and will replace it with a fresh
             // one after this process completes.
-            main_pkg.fetchAndAddDependencies(
+            const fetch_result = main_pkg.fetchAndAddDependencies(
                 arena,
                 &thread_pool,
                 &http_client,
@@ -4446,12 +4448,19 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
                 &dependencies_source,
                 &build_roots_source,
                 "",
-                color,
+                &errors,
                 &all_modules,
-            ) catch |err| switch (err) {
-                error.PackageFetchFailed => process.exit(1),
-                else => |e| return e,
-            };
+            );
+            if (errors.errorMessageCount() > 0) {
+                const ttyconf: std.debug.TTY.Config = switch (color) {
+                    .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
+                    .on => .escape_codes,
+                    .off => .no_color,
+                };
+                errors.renderToStdErr(ttyconf);
+                process.exit(1);
+            }
+            try fetch_result;
 
             try dependencies_source.appendSlice("};\npub const build_root = struct {\n");
             try dependencies_source.appendSlice(build_roots_source.items);
@@ -4543,7 +4552,7 @@ pub fn cmdBuild(gpa: Allocator, arena: Allocator, args: []const []const u8) !voi
 }
 
 fn readSourceFileToEndAlloc(
-    allocator: mem.Allocator,
+    allocator: Allocator,
     input: *const fs.File,
     size_hint: ?usize,
 ) ![:0]u8 {
@@ -4687,12 +4696,9 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
         };
         defer tree.deinit(gpa);
 
-        try printErrsMsgToStdErr(gpa, arena, tree, "<stdin>", color);
+        try printAstErrorsToStderr(gpa, tree, "<stdin>", color);
         var has_ast_error = false;
         if (check_ast_flag) {
-            const Module = @import("Module.zig");
-            const AstGen = @import("AstGen.zig");
-
             var file: Module.File = .{
                 .status = .never_loaded,
                 .source_loaded = true,
@@ -4715,20 +4721,16 @@ pub fn cmdFmt(gpa: Allocator, arena: Allocator, args: []const []const u8) !void 
             defer file.zir.deinit(gpa);
 
             if (file.zir.hasCompileErrors()) {
-                var arena_instance = std.heap.ArenaAllocator.init(gpa);
-                defer arena_instance.deinit();
-                var errors = std.ArrayList(Compilation.AllErrors.Message).init(gpa);
-                defer errors.deinit();
-
-                try Compilation.AllErrors.addZir(arena_instance.allocator(), &errors, &file);
+                var errors: std.zig.ErrorBundle = undefined;
+                try errors.init(gpa);
+                defer errors.deinit(gpa);
+                try Compilation.addZirErrorMessages(gpa, &errors, &file);
                 const ttyconf: std.debug.TTY.Config = switch (color) {
                     .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
                     .on => .escape_codes,
                     .off => .no_color,
                 };
-                for (errors.items) |full_err_msg| {
-                    full_err_msg.renderToStdErr(ttyconf);
-                }
+                errors.renderToStdErr(ttyconf);
                 has_ast_error = true;
             }
         }
@@ -4874,12 +4876,13 @@ fn fmtPathFile(
     if (stat.kind == .Directory)
         return error.IsDir;
 
+    const gpa = fmt.gpa;
     const source_code = try readSourceFileToEndAlloc(
-        fmt.gpa,
+        gpa,
         &source_file,
         std.math.cast(usize, stat.size) orelse return error.FileTooBig,
     );
-    defer fmt.gpa.free(source_code);
+    defer gpa.free(source_code);
 
     source_file.close();
     file_closed = true;
@@ -4887,19 +4890,16 @@ fn fmtPathFile(
     // Add to set after no longer possible to get error.IsDir.
     if (try fmt.seen.fetchPut(stat.inode, {})) |_| return;
 
-    var tree = try Ast.parse(fmt.gpa, source_code, .zig);
-    defer tree.deinit(fmt.gpa);
+    var tree = try Ast.parse(gpa, source_code, .zig);
+    defer tree.deinit(gpa);
 
-    try printErrsMsgToStdErr(fmt.gpa, fmt.arena, tree, file_path, fmt.color);
+    try printAstErrorsToStderr(gpa, tree, file_path, fmt.color);
     if (tree.errors.len != 0) {
         fmt.any_error = true;
         return;
     }
 
     if (fmt.check_ast) {
-        const Module = @import("Module.zig");
-        const AstGen = @import("AstGen.zig");
-
         var file: Module.File = .{
             .status = .never_loaded,
             .source_loaded = true,
@@ -4918,31 +4918,27 @@ fn fmtPathFile(
             .root_decl = .none,
         };
 
-        file.pkg = try Package.create(fmt.gpa, null, file.sub_file_path);
-        defer file.pkg.destroy(fmt.gpa);
+        file.pkg = try Package.create(gpa, null, file.sub_file_path);
+        defer file.pkg.destroy(gpa);
 
         if (stat.size > max_src_size)
             return error.FileTooBig;
 
-        file.zir = try AstGen.generate(fmt.gpa, file.tree);
+        file.zir = try AstGen.generate(gpa, file.tree);
         file.zir_loaded = true;
-        defer file.zir.deinit(fmt.gpa);
+        defer file.zir.deinit(gpa);
 
         if (file.zir.hasCompileErrors()) {
-            var arena_instance = std.heap.ArenaAllocator.init(fmt.gpa);
-            defer arena_instance.deinit();
-            var errors = std.ArrayList(Compilation.AllErrors.Message).init(fmt.gpa);
-            defer errors.deinit();
-
-            try Compilation.AllErrors.addZir(arena_instance.allocator(), &errors, &file);
+            var errors: std.zig.ErrorBundle = undefined;
+            try errors.init(gpa);
+            defer errors.deinit(gpa);
+            try Compilation.addZirErrorMessages(gpa, &errors, &file);
             const ttyconf: std.debug.TTY.Config = switch (fmt.color) {
                 .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
                 .on => .escape_codes,
                 .off => .no_color,
             };
-            for (errors.items) |full_err_msg| {
-                full_err_msg.renderToStdErr(ttyconf);
-            }
+            errors.renderToStdErr(ttyconf);
             fmt.any_error = true;
         }
     }
@@ -4970,100 +4966,53 @@ fn fmtPathFile(
     }
 }
 
-pub fn printErrsMsgToStdErr(
-    gpa: mem.Allocator,
-    arena: mem.Allocator,
+fn printAstErrorsToStderr(gpa: Allocator, tree: Ast, path: []const u8, color: Color) !void {
+    var error_bundle: std.zig.ErrorBundle = undefined;
+    try error_bundle.init(gpa);
+    defer error_bundle.deinit(gpa);
+
+    try putAstErrorsIntoBundle(gpa, tree, path, &error_bundle);
+
+    const ttyconf: std.debug.TTY.Config = switch (color) {
+        .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
+        .on => .escape_codes,
+        .off => .no_color,
+    };
+    error_bundle.renderToStdErr(ttyconf);
+}
+
+pub fn putAstErrorsIntoBundle(
+    gpa: Allocator,
     tree: Ast,
     path: []const u8,
-    color: Color,
+    error_bundle: *std.zig.ErrorBundle,
 ) !void {
-    const parse_errors: []const Ast.Error = tree.errors;
-    var i: usize = 0;
-    while (i < parse_errors.len) : (i += 1) {
-        const parse_error = parse_errors[i];
-        const lok_token = parse_error.token;
-        const token_tags = tree.tokens.items(.tag);
-        const start_loc = tree.tokenLocation(0, lok_token);
-        const source_line = tree.source[start_loc.line_start..start_loc.line_end];
+    var file: Module.File = .{
+        .status = .never_loaded,
+        .source_loaded = true,
+        .zir_loaded = false,
+        .sub_file_path = path,
+        .source = tree.source,
+        .stat = .{
+            .size = 0,
+            .inode = 0,
+            .mtime = 0,
+        },
+        .tree = tree,
+        .tree_loaded = true,
+        .zir = undefined,
+        .pkg = undefined,
+        .root_decl = .none,
+    };
 
-        var text_buf = std.ArrayList(u8).init(gpa);
-        defer text_buf.deinit();
-        const writer = text_buf.writer();
-        try tree.renderError(parse_error, writer);
-        const text = try arena.dupe(u8, text_buf.items);
+    file.pkg = try Package.create(gpa, null, path);
+    defer file.pkg.destroy(gpa);
 
-        var notes_buffer: [2]Compilation.AllErrors.Message = undefined;
-        var notes_len: usize = 0;
+    file.zir = try AstGen.generate(gpa, file.tree);
+    file.zir_loaded = true;
+    defer file.zir.deinit(gpa);
 
-        if (token_tags[parse_error.token + @boolToInt(parse_error.token_is_prev)] == .invalid) {
-            const bad_off = @intCast(u32, tree.tokenSlice(parse_error.token + @boolToInt(parse_error.token_is_prev)).len);
-            const byte_offset = @intCast(u32, start_loc.line_start) + @intCast(u32, start_loc.column) + bad_off;
-            notes_buffer[notes_len] = .{
-                .src = .{
-                    .src_path = path,
-                    .msg = try std.fmt.allocPrint(arena, "invalid byte: '{'}'", .{
-                        std.zig.fmtEscapes(tree.source[byte_offset..][0..1]),
-                    }),
-                    .span = .{ .start = byte_offset, .end = byte_offset + 1, .main = byte_offset },
-                    .line = @intCast(u32, start_loc.line),
-                    .column = @intCast(u32, start_loc.column) + bad_off,
-                    .source_line = source_line,
-                },
-            };
-            notes_len += 1;
-        }
-
-        for (parse_errors[i + 1 ..]) |note| {
-            if (!note.is_note) break;
-
-            text_buf.items.len = 0;
-            try tree.renderError(note, writer);
-            const note_loc = tree.tokenLocation(0, note.token);
-            const byte_offset = @intCast(u32, note_loc.line_start);
-            notes_buffer[notes_len] = .{
-                .src = .{
-                    .src_path = path,
-                    .msg = try arena.dupe(u8, text_buf.items),
-                    .span = .{
-                        .start = byte_offset,
-                        .end = byte_offset + @intCast(u32, tree.tokenSlice(note.token).len),
-                        .main = byte_offset,
-                    },
-                    .line = @intCast(u32, note_loc.line),
-                    .column = @intCast(u32, note_loc.column),
-                    .source_line = tree.source[note_loc.line_start..note_loc.line_end],
-                },
-            };
-            i += 1;
-            notes_len += 1;
-        }
-
-        const extra_offset = tree.errorOffset(parse_error);
-        const byte_offset = @intCast(u32, start_loc.line_start) + extra_offset;
-        const message: Compilation.AllErrors.Message = .{
-            .src = .{
-                .src_path = path,
-                .msg = text,
-                .span = .{
-                    .start = byte_offset,
-                    .end = byte_offset + @intCast(u32, tree.tokenSlice(lok_token).len),
-                    .main = byte_offset,
-                },
-                .line = @intCast(u32, start_loc.line),
-                .column = @intCast(u32, start_loc.column) + extra_offset,
-                .source_line = source_line,
-                .notes = notes_buffer[0..notes_len],
-            },
-        };
-
-        const ttyconf: std.debug.TTY.Config = switch (color) {
-            .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
-            .on => .escape_codes,
-            .off => .no_color,
-        };
-
-        message.renderToStdErr(ttyconf);
-    }
+    try Compilation.addZirErrorMessages(gpa, error_bundle, &file);
 }
 
 pub const info_zen =
@@ -5546,8 +5495,6 @@ pub fn cmdAstCheck(
     arena: Allocator,
     args: []const []const u8,
 ) !void {
-    const Module = @import("Module.zig");
-    const AstGen = @import("AstGen.zig");
     const Zir = @import("Zir.zig");
 
     var color: Color = .auto;
@@ -5637,7 +5584,7 @@ pub fn cmdAstCheck(
     file.tree_loaded = true;
     defer file.tree.deinit(gpa);
 
-    try printErrsMsgToStdErr(gpa, arena, file.tree, file.sub_file_path, color);
+    try printAstErrorsToStderr(gpa, file.tree, file.sub_file_path, color);
     if (file.tree.errors.len != 0) {
         process.exit(1);
     }
@@ -5647,16 +5594,16 @@ pub fn cmdAstCheck(
     defer file.zir.deinit(gpa);
 
     if (file.zir.hasCompileErrors()) {
-        var errors = std.ArrayList(Compilation.AllErrors.Message).init(arena);
-        try Compilation.AllErrors.addZir(arena, &errors, &file);
+        var errors: std.zig.ErrorBundle = undefined;
+        try errors.init(gpa);
+        defer errors.deinit(gpa);
+        try Compilation.addZirErrorMessages(gpa, &errors, &file);
         const ttyconf: std.debug.TTY.Config = switch (color) {
             .auto => std.debug.detectTTYConfig(std.io.getStdErr()),
             .on => .escape_codes,
             .off => .no_color,
         };
-        for (errors.items) |full_err_msg| {
-            full_err_msg.renderToStdErr(ttyconf);
-        }
+        errors.renderToStdErr(ttyconf);
         process.exit(1);
     }
 
@@ -5714,8 +5661,6 @@ pub fn cmdChangelist(
     arena: Allocator,
     args: []const []const u8,
 ) !void {
-    const Module = @import("Module.zig");
-    const AstGen = @import("AstGen.zig");
     const Zir = @import("Zir.zig");
 
     const old_source_file = args[0];
@@ -5763,7 +5708,7 @@ pub fn cmdChangelist(
     file.tree_loaded = true;
     defer file.tree.deinit(gpa);
 
-    try printErrsMsgToStdErr(gpa, arena, file.tree, old_source_file, .auto);
+    try printAstErrorsToStderr(gpa, file.tree, old_source_file, .auto);
     if (file.tree.errors.len != 0) {
         process.exit(1);
     }
@@ -5773,12 +5718,12 @@ pub fn cmdChangelist(
     defer file.zir.deinit(gpa);
 
     if (file.zir.hasCompileErrors()) {
-        var errors = std.ArrayList(Compilation.AllErrors.Message).init(arena);
-        try Compilation.AllErrors.addZir(arena, &errors, &file);
+        var errors: std.zig.ErrorBundle = undefined;
+        try errors.init(gpa);
+        defer errors.deinit(gpa);
+        try Compilation.addZirErrorMessages(gpa, &errors, &file);
         const ttyconf = std.debug.detectTTYConfig(std.io.getStdErr());
-        for (errors.items) |full_err_msg| {
-            full_err_msg.renderToStdErr(ttyconf);
-        }
+        errors.renderToStdErr(ttyconf);
         process.exit(1);
     }
 
@@ -5800,7 +5745,7 @@ pub fn cmdChangelist(
     var new_tree = try Ast.parse(gpa, new_source, .zig);
     defer new_tree.deinit(gpa);
 
-    try printErrsMsgToStdErr(gpa, arena, new_tree, new_source_file, .auto);
+    try printAstErrorsToStderr(gpa, new_tree, new_source_file, .auto);
     if (new_tree.errors.len != 0) {
         process.exit(1);
     }
@@ -5812,12 +5757,12 @@ pub fn cmdChangelist(
     file.zir_loaded = true;
 
     if (file.zir.hasCompileErrors()) {
-        var errors = std.ArrayList(Compilation.AllErrors.Message).init(arena);
-        try Compilation.AllErrors.addZir(arena, &errors, &file);
+        var errors: std.zig.ErrorBundle = undefined;
+        try errors.init(gpa);
+        defer errors.deinit(gpa);
+        try Compilation.addZirErrorMessages(gpa, &errors, &file);
         const ttyconf = std.debug.detectTTYConfig(std.io.getStdErr());
-        for (errors.items) |full_err_msg| {
-            full_err_msg.renderToStdErr(ttyconf);
-        }
+        errors.renderToStdErr(ttyconf);
         process.exit(1);
     }
 
